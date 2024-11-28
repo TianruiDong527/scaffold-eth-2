@@ -1,78 +1,147 @@
-//SPDX-License-Identifier: MIT
-pragma solidity >=0.8.0 <0.9.0;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.2; //Do not change the solidity version as it negatively impacts submission grading
 
-// Useful for debugging. Remove when deploying to a live network.
-import "hardhat/console.sol";
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
+import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
-// Use openzeppelin to inherit battle-tested implementations (ERC20, ERC721, etc)
-// import "@openzeppelin/contracts/access/Ownable.sol";
+contract YourCollectible is
+    ERC721,
+    ERC721Enumerable,
+    ERC721URIStorage,
+    Ownable,
+    ReentrancyGuard
+{
+    using Counters for Counters.Counter;
 
-/**
- * A smart contract that allows changing a state variable of the contract and tracking the changes
- * It also allows the owner to withdraw the Ether in the contract
- * @author BuidlGuidl
- */
-contract YourContract {
-    // State Variables
-    address public immutable owner;
-    string public greeting = "Building Unstoppable Apps!!!";
-    bool public premium = false;
-    uint256 public totalCounter = 0;
-    mapping(address => uint) public userGreetingCounter;
+    Counters.Counter public tokenIdCounter;
 
-    // Events: a way to emit log statements from smart contract that can be listened to by external parties
-    event GreetingChange(address indexed greetingSetter, string newGreeting, bool premium, uint256 value);
+    constructor() ERC721("YourCollectible", "YCB") {}
 
-    // Constructor: Called once on contract deployment
-    // Check packages/hardhat/deploy/00_deploy_your_contract.ts
-    constructor(address _owner) {
-        owner = _owner;
+    function _baseURI() internal pure override returns (string memory) {
+        return "https://ipfs.io/ipfs/";
     }
 
-    // Modifier: used to define a set of rules that must be met before or after a function is executed
-    // Check the withdraw() function
-    modifier isOwner() {
-        // msg.sender: predefined variable that represents address of the account that called the current function
-        require(msg.sender == owner, "Not the Owner");
-        _;
+    function mintItem(address to, string memory uri) public returns (uint256) {
+        tokenIdCounter.increment();
+        uint256 tokenId = tokenIdCounter.current();
+        _safeMint(to, tokenId);
+        _setTokenURI(tokenId, uri);
+        return tokenId;
     }
 
-    /**
-     * Function that allows anyone to change the state variable "greeting" of the contract and increase the counters
-     *
-     * @param _newGreeting (string memory) - new greeting to save on the contract
-     */
-    function setGreeting(string memory _newGreeting) public payable {
-        // Print data to the hardhat chain console. Remove when deploying to a live network.
-        console.log("Setting new greeting '%s' from %s", _newGreeting, msg.sender);
+    // Auction structure
+    struct Auction {
+        address seller;
+        address highestBidder;
+        uint256 highestBid;
+        uint256 startingPrice; // New: starting price for the auction
+        uint256 endTime;
+        bool active;
+    }
 
-        // Change state variables
-        greeting = _newGreeting;
-        totalCounter += 1;
-        userGreetingCounter[msg.sender] += 1;
+    // Mapping from token ID to auction details
+    mapping(uint256 => Auction) public auctions;
 
-        // msg.value: built-in global variable that represents the amount of ether sent with the transaction
-        if (msg.value > 0) {
-            premium = true;
-        } else {
-            premium = false;
+    event AuctionCreated(uint256 indexed tokenId, uint256 startingPrice, uint256 endTime);
+    event BidPlaced(uint256 indexed tokenId, address bidder, uint256 amount);
+    event AuctionEnded(uint256 indexed tokenId, address winner, uint256 amount);
+
+    // Function to create an auction for an NFT
+    function createAuction(uint256 tokenId, uint256 duration, uint256 startingPrice) external {
+        require(ownerOf(tokenId) == msg.sender, "You are not the owner of this NFT");
+        require(auctions[tokenId].active == false, "Auction already active");
+        require(startingPrice > 0, "Starting price must be greater than 0");
+
+        // Transfer NFT to the contract
+        _transfer(msg.sender, address(this), tokenId);
+
+        auctions[tokenId] = Auction({
+            seller: msg.sender,
+            highestBidder: address(0),
+            highestBid: 0,
+            startingPrice: startingPrice,
+            endTime: block.timestamp + duration,
+            active: true
+        });
+
+        emit AuctionCreated(tokenId, startingPrice, block.timestamp + duration);
+    }
+
+    // Function to place a bid on an active auction
+    function placeBid(uint256 tokenId) external payable nonReentrant {
+        Auction storage auction = auctions[tokenId];
+        require(auction.active, "Auction is not active");
+        require(block.timestamp < auction.endTime, "Auction has ended");
+        require(msg.value > auction.highestBid && msg.value >= auction.startingPrice, "Bid must be higher than current highest bid and starting price");
+
+        // Refund the previous highest bidder
+        if (auction.highestBidder != address(0)) {
+            payable(auction.highestBidder).transfer(auction.highestBid);
         }
 
-        // emit: keyword used to trigger an event
-        emit GreetingChange(msg.sender, _newGreeting, msg.value > 0, msg.value);
+        auction.highestBidder = msg.sender;
+        auction.highestBid = msg.value;
+
+        emit BidPlaced(tokenId, msg.sender, msg.value);
     }
 
-    /**
-     * Function that allows the owner to withdraw all the Ether in the contract
-     * The function can only be called by the owner of the contract as defined by the isOwner modifier
-     */
-    function withdraw() public isOwner {
-        (bool success, ) = owner.call{ value: address(this).balance }("");
-        require(success, "Failed to send Ether");
+    // Function to end an auction
+    function endAuction(uint256 tokenId) external nonReentrant {
+        Auction storage auction = auctions[tokenId];
+        require(auction.active, "Auction is not active");
+        require(block.timestamp >= auction.endTime, "Auction has not ended yet");
+
+        auction.active = false;
+
+        // If there is a winner
+        if (auction.highestBidder != address(0)) {
+            // Transfer NFT to the highest bidder
+            _transfer(address(this), auction.highestBidder, tokenId);
+
+            // Pay the seller
+            payable(auction.seller).transfer(auction.highestBid);
+        } else {
+            // Return NFT to the seller if no bids were made
+            _transfer(address(this), auction.seller, tokenId);
+        }
+
+        emit AuctionEnded(tokenId, auction.highestBidder, auction.highestBid);
     }
 
-    /**
-     * Function that allows the contract to receive ETH
-     */
-    receive() external payable {}
+    // The following functions are overrides required by Solidity.
+
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 tokenId,
+        uint256 quantity
+    ) internal override(ERC721, ERC721Enumerable) {
+        super._beforeTokenTransfer(from, to, tokenId, quantity);
+    }
+
+    function _burn(uint256 tokenId) internal override(ERC721, ERC721URIStorage) {
+        super._burn(tokenId);
+    }
+
+    function tokenURI(uint256 tokenId)
+        public
+        view
+        override(ERC721, ERC721URIStorage)
+        returns (string memory)
+    {
+        return super.tokenURI(tokenId);
+    }
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721, ERC721Enumerable, ERC721URIStorage)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
 }
